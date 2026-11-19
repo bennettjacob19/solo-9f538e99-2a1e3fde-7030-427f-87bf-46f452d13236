@@ -8,7 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 ENV PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/app.db
+    DB_PATH=/data/app.db \
+    ROUND_DB_DIR=/data/rounds
 
-# Default command starts the resolver; compose overrides per service.
-CMD ["python", "-m", "app.resolver"]
+# The console starts each regression round's authoritative endpoint and
+# resolver itself (child processes with per-round ports and databases).
+CMD ["python", "-m", "app.web"]

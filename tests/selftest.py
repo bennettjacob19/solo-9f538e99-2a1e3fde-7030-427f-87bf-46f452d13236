@@ -1,135 +1,60 @@
 #!/usr/bin/env python3
-"""End-to-end self-test for the serve-stale DNS duty system.
+"""Self-test for the regression console (runs without Docker).
 
-Spawns auth + resolver + web on loopback with the production timing
-parameters (fresh TTL 5s, stale window 20s, upstream timeout 2s) and drives
-the key interleavings:
+It spawns the web console on loopback with production timings (fresh TTL 5s,
+stale window 20s, upstream timeout 2s) and checks:
 
-  A. basic fetch / fresh-cache hit / TTL countdown / refresh after expiry
-  B. upstream timeout after expiry -> stale A (<=20s) -> SERVFAIL beyond
-  C. confirmed NXDOMAIN purges the old A; NXDOMAIN is never served stale
-  D. a late (delayed) old answer cannot resurrect anything
-  E. resolver restart does not extend the old A's validity
-  F. web console smoke test (page, mode switch, query, state)
+  1. case validation: at most 12 steps, waits add up to at most 30s, RCODE and
+     "none" handling;
+  2. round A: basic upstream/fresh-cache steps, the setting-step number
+     returned by the authoritative side, and the same A configured twice being
+     told apart by the step number;
+  3. round B running *in parallel* with its own authoritative configuration,
+     cache and logs;
+  4. NXDOMAIN is cached fresh with its step number and purged A record; stale
+     serving keeps the old step number;
+  5. a query step with no DNS reply interrupts the round at that step; earlier
+     results stay; the round's processes are recycled;
+  6. an endpoint that cannot start interrupts the round at startup with the
+     cause, and still recycles.
+  7. the page and API responses are present.
 
-Exits non-zero if any check fails.  Runtime: ~95s.
+Exits non-zero if any check fails.  Runtime: ~70s.
 """
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from dnslib import QTYPE, DNSRecord  # noqa: E402
-
-DOMAIN = "service.example"
-AUTH_PORT, RES_PORT, WEB_PORT = 15354, 15353, 18000
-TMP = tempfile.mkdtemp(prefix="dns-selftest-")
-DB = os.path.join(TMP, "app.db")
-
+TMP = tempfile.mkdtemp(prefix="dns-regtest-")
+WEB_PORT = 18000
+BASE = f"http://127.0.0.1:{WEB_PORT}"
 env = dict(os.environ)
 env.update(
-    DB_PATH=DB,
-    FIXED_DOMAIN=DOMAIN,
-    AUTH_HOST="127.0.0.1",
-    AUTH_PORT=str(AUTH_PORT),
-    RESOLVER_HOST="127.0.0.1",
-    RESOLVER_PORT=str(RES_PORT),
+    DB_PATH=os.path.join(TMP, "app.db"),
+    ROUND_DB_DIR=os.path.join(TMP, "rounds"),
+    FIXED_DOMAIN="service.example",
     WEB_PORT=str(WEB_PORT),
     FRESH_TTL="5",
     STALE_WINDOW="20",
     UPSTREAM_TIMEOUT="2",
-    DEFAULT_IP="192.0.2.10",
-    DEFAULT_DELAY="3",
     PYTHONPATH=ROOT,
     PYTHONUNBUFFERED="1",
 )
 
-procs: dict[str, subprocess.Popen] = {}
 FAILS: list[str] = []
-
-
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-def start(name: str, module: str) -> None:
-    log = open(os.path.join(TMP, f"{name}.log"), "ab")
-    procs[name] = subprocess.Popen(
-        [sys.executable, "-m", module],
-        cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-    )
-
-
-def stop(name: str) -> None:
-    p = procs.get(name)
-    if p and p.poll() is None:
-        p.terminate()
-        try:
-            p.wait(5)
-        except subprocess.TimeoutExpired:
-            p.kill()
-
-
-def set_mode(mode: str, ip: str = "192.0.2.10", delay: float = 3.0) -> None:
-    conn = sqlite3.connect(DB, timeout=15)
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute(
-        "INSERT INTO control(id, mode, ip, delay_seconds, updated_at)"
-        " VALUES (1, ?, ?, ?, ?)"
-        " ON CONFLICT(id) DO UPDATE SET mode=excluded.mode, ip=excluded.ip,"
-        " delay_seconds=excluded.delay_seconds, updated_at=excluded.updated_at",
-        (mode, ip, delay, time.time()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_cache() -> dict | None:
-    conn = sqlite3.connect(DB, timeout=15)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM cache WHERE id = 1").fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def auth_actions() -> list[tuple]:
-    conn = sqlite3.connect(DB, timeout=15)
-    rows = conn.execute(
-        "SELECT mode, action, detail FROM auth_log ORDER BY id"
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def clear_cache() -> None:
-    conn = sqlite3.connect(DB, timeout=15)
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute("DELETE FROM cache WHERE id = 1")
-    conn.commit()
-    conn.close()
-
-
-def dns_query() -> tuple[int, list[tuple], str | None]:
-    """Returns (rcode, [(type, data, ttl)], source)."""
-    q = DNSRecord.question(DOMAIN, "A")
-    data = q.send("127.0.0.1", RES_PORT, timeout=8)
-    rep = DNSRecord.parse(data)
-    answers = [(QTYPE[rr.rtype], str(rr.rdata), rr.ttl) for rr in rep.rr]
-    src = None
-    for rr in rep.ar:
-        if rr.rtype == QTYPE.TXT:
-            txt = str(rr.rdata).strip('"')
-            if txt.startswith("source="):
-                src = txt.split("=", 1)[1].split()[0]
-    return rep.header.rcode, answers, src
+proc: subprocess.Popen | None = None
 
 
 def check(name: str, cond: bool, info: str = "") -> None:
@@ -138,28 +63,46 @@ def check(name: str, cond: bool, info: str = "") -> None:
         FAILS.append(name)
 
 
-def sleep_until(ts: float) -> None:
-    time.sleep(max(0.0, ts - time.time()))
-
-
-def wait_resolver_ready(timeout: float = 25) -> bool:
-    t0 = time.time()
-    while time.time() - t0 < timeout:
+def http(method: str, path: str, body=None, timeout: float = 40):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        BASE + path, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as exc:
         try:
-            dns_query()
-            return True
+            return exc.code, json.load(exc)
         except Exception:
-            time.sleep(0.3)
-    return False
+            return exc.code, {"error": exc.reason}
 
 
-def wait_web_ready(timeout: float = 25) -> bool:
-    t0 = time.time()
-    while time.time() - t0 < timeout:
+def run(round_id: str, steps: list[dict]) -> dict:
+    status, payload = http("POST", f"/api/rounds/{round_id}/run", {"steps": steps})
+    if status != 200 or not payload.get("ok"):
+        return {"ok": False, "error": payload.get("error"), "status": status}
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        _, st = http("GET", f"/api/rounds/{round_id}")
+        reg = st.get("regression")
+        if reg and reg.get("status") != "running":
+            return {"ok": True, "state": st, "reg": reg}
+        time.sleep(0.4)
+    return {"ok": False, "error": "case did not finish in time"}
+
+
+def st_after_active(round_id: str) -> bool:
+    """True when the round still reports live child processes."""
+    _, st = http("GET", f"/api/rounds/{round_id}")
+    return bool(st.get("active") or st.get("pids"))
+
+
+def wait_web(timeout: float = 25) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{WEB_PORT}/api/state", timeout=2
-            ) as r:
+            with urllib.request.urlopen(BASE + "/api/params", timeout=2) as r:
                 if r.status == 200:
                     return True
         except Exception:
@@ -167,185 +110,340 @@ def wait_web_ready(timeout: float = 25) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------
-# scenario
-# --------------------------------------------------------------------------
-def main() -> int:
-    print(f"[selftest] workdir={TMP}", flush=True)
-    start("auth", "app.auth_server")
-    start("resolver", "app.resolver")
-    start("web", "app.web")
+def alive_ports(state: dict) -> list[int]:
+    return [p for p in (state.get("auth_port"), state.get("resolver_port")) if p]
+
+
+def burstable(port: int) -> bool:
+    """True when something still answers an A query on that UDP port."""
+    from dnslib import DNSRecord
+    q = DNSRecord.question("service.example", "A")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        if not (wait_resolver_ready() and wait_web_ready()):
-            print("  [FAIL] services did not come up")
+        sock.settimeout(0.6)
+        sock.sendto(q.pack(), ("127.0.0.1", port))
+        sock.recvfrom(4096)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def main() -> int:
+    global proc
+    print(f"[regtest] workdir={TMP}", flush=True)
+    proc = subprocess.Popen([sys.executable, "-m", "app.web"], cwd=ROOT, env=env,
+                            stdout=open(os.path.join(TMP, "web.log"), "ab"),
+                            stderr=subprocess.STDOUT)
+    try:
+        if not wait_web():
+            print("  [FAIL] web console did not come up")
             return 1
 
-        # -- A. basic fetch / fresh cache / refresh --------------------------
-        print("A. 基本应答与新鲜缓存", flush=True)
-        clear_cache()  # the readiness probe already populated the cache
-        set_mode("a", "192.0.2.10")
-        rc, ans, src = dns_query()
-        check("A1 上游取回 A", rc == 0 and ans == [("A", "192.0.2.10", 5)]
-              and src == "upstream", f"rcode={rc} ans={ans} src={src}")
-        rc, ans, src = dns_query()
-        check("A2 命中新鲜缓存", rc == 0 and src == "cache-fresh"
-              and ans and ans[0][1] == "192.0.2.10" and 1 <= ans[0][2] <= 5,
-              f"ans={ans} src={src}")
-        set_mode("a", "192.0.2.20")  # change the A record on the auth side
-        rc, ans, src = dns_query()
-        check("A3 缓存期内仍给旧 IP", rc == 0 and src == "cache-fresh"
-              and ans and ans[0][1] == "192.0.2.10", f"ans={ans} src={src}")
-        time.sleep(5.5)
-        rc, ans, src = dns_query()
-        check("A4 过期后重新取回新 IP", rc == 0 and src == "upstream"
-              and ans == [("A", "192.0.2.20", 5)], f"ans={ans} src={src}")
-        cache = get_cache()
-        fresh_until, stale_until = cache["fresh_until"], cache["stale_until"]
+        # -- 1. validation ---------------------------------------------------
+        print("1. 用例校验", flush=True)
+        _, p = http("GET", "/api/params")
+        check("1a 参数上限", p["max_steps"] == 12 and p["max_total_wait"] == 30)
+        too_many = [{"type": "wait", "seconds": 0}] * 13
+        st, r = http("POST", "/api/rounds/A/run", {"steps": too_many})
+        check("1b 超过 12 步被拒绝", st == 400 and "12" in r.get("error", ""),
+              r.get("error"))
+        too_long = [{"type": "wait", "seconds": 20},
+                    {"type": "wait", "seconds": 11}]
+        st, r = http("POST", "/api/rounds/A/run", {"steps": too_long})
+        check("1c 合计等待超过 30s 被拒绝", st == 400, r.get("error"))
+        st, r = http("POST", "/api/rounds/A/run",
+                     {"steps": [{"type": "query", "expect_rcode": "BOGUS"}]})
+        check("1d 非法 RCODE 被拒绝", st == 400, r.get("error"))
 
-        # -- B. stale on timeout, SERVFAIL beyond the window -----------------
-        print("B. 过期+上游超时 -> 旧 A 沿用 <=20s -> SERVFAIL", flush=True)
-        set_mode("timeout")
-        sleep_until(fresh_until + 0.5)
-        t0 = time.time()
-        rc, ans, src = dns_query()
-        check("B1 上游超时后给旧 A(stale)",
-              rc == 0 and src == "cache-stale" and ans
-              and ans[0][1] == "192.0.2.20"
-              and stale_until - time.time() - 1 <= ans[0][2] <= 20,
-              f"ans={ans} src={src} 耗时={time.time()-t0:.1f}s")
-        sleep_until(stale_until - 4)
-        rc, ans, src = dns_query()
-        check("B2 窗口末尾仍是 stale", rc == 0 and src == "cache-stale",
-              f"ans={ans} src={src}")
-        sleep_until(stale_until + 1)
-        rc, ans, src = dns_query()
-        check("B3 超过 20s 返回 SERVFAIL", rc == 2 and not ans and src == "none",
-              f"rcode={rc} ans={ans} src={src}")
+        # -- 2. round A: steps and step numbers ------------------------------
+        print("2. 轮次 A：步骤号区分相同 A 地址", flush=True)
+        case_a = [
+            {"type": "mode", "mode": "a", "ip": "192.0.2.10", "delay_seconds": 3},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.10", "expect_step": 1},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.10", "expect_step": 1},
+            {"type": "wait", "seconds": 6},
+            {"type": "mode", "mode": "a", "ip": "192.0.2.10", "delay_seconds": 1},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.10", "expect_step": 5},
+        ]
+        res_a = run("A", case_a)
+        check("2a 轮次 A 用例完成", res_a.get("ok"), res_a.get("error"))
+        if res_a.get("ok"):
+            steps = res_a["reg"]["results"]
+            statuses = [s["status"] for s in steps]
+            check("2b 全部步骤通过", statuses == ["ok"] * 6, str(statuses))
+            check("2c 第二次同址设置为新步骤号",
+                  steps[5]["actual"]["auth_step"] == "5"
+                  and steps[1]["actual"]["auth_step"] == "1",
+                  str([s["actual"] and s["actual"].get("auth_step") for s in steps]))
+            sources = [s["actual"]["source"] for s in steps if s["actual"]]
+            check("2d 来源为 upstream 与缓存",
+                  sources[0] in ("upstream",) and sources[1] == "cache-fresh"
+                  and sources[2] == "upstream", str(sources))
+            ports = alive_ports(res_a["state"])
+            check("2e 轮次结束后进程已回收",
+                  not burstable(ports[1]) and not burstable(ports[0]),
+                  f"ports={ports}")
 
-        # -- C. NXDOMAIN purges old A; NXDOMAIN never served stale -----------
-        print("C. 确认 NXDOMAIN 清除旧 A；NXDOMAIN 不作过期备用", flush=True)
-        set_mode("a", "192.0.2.30")
-        rc, ans, src = dns_query()
-        assert rc == 0 and src == "upstream", f"setup failed: {rc} {src}"
-        set_mode("nxdomain")
-        time.sleep(5.5)  # let the fresh A expire
-        rc, ans, src = dns_query()
-        check("C1 上游确认 NXDOMAIN", rc == 3 and not ans and src == "upstream",
-              f"rcode={rc} ans={ans} src={src}")
-        cache = get_cache()
-        check("C2 旧 A 已被持久清除",
-              cache["rcode"] == "NXDOMAIN" and cache["a_record"] is None
-              and cache["stale_until"] is None,
-              f"cache={cache}")
-        set_mode("timeout")
-        time.sleep(5.5)  # let the fresh NXDOMAIN expire
-        rc, ans, src = dns_query()
-        check("C3 NXDOMAIN 不作 stale 备用 -> SERVFAIL",
-              rc == 2 and not ans and src == "none",
-              f"rcode={rc} ans={ans} src={src}")
+        # -- 2f. live operations while a case is running ----------------------
+        print("2f. 用例运行中现场查询/切换照常", flush=True)
+        http("POST", "/api/rounds/A/run", {"steps": [
+            {"type": "mode", "mode": "a", "ip": "192.0.2.10", "delay_seconds": 1},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.10", "expect_step": 1},
+            {"type": "wait", "seconds": 4},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.10", "expect_step": 1},
+        ]})
+        time.sleep(0.8)
+        st, live_q = http("POST", "/api/rounds/A/query", {})
+        check("2f1 运行中现场查询照常", st == 200 and live_q.get("ok")
+              and live_q.get("a_records") == ["192.0.2.10"], str(live_q))
+        st, live_m = http("POST", "/api/rounds/A/mode",
+                          {"mode": "a", "ip": "192.0.2.99", "delay_seconds": 1})
+        check("2f2 运行中手动切换照常", st == 200 and live_m.get("ok"), str(live_m))
+        time.sleep(6)  # let the running case finish (its step 2 may now differ)
+        deadline = time.time() + 30
+        reg = None
+        while time.time() < deadline:
+            _, st_a = http("GET", "/api/rounds/A")
+            reg = st_a.get("regression")
+            if reg and reg.get("status") != "running":
+                break
+            time.sleep(0.4)
+        check("2f3 并行现场操作后用例正常结束", reg is not None
+              and reg.get("status") == "done", str(reg and reg.get("status")))
 
-        # -- D. late old answer cannot resurrect -----------------------------
-        print("D. 超时后迟到的旧答复不能复活记录", flush=True)
-        set_mode("a", "192.0.2.40")
-        rc, ans, src = dns_query()
-        assert rc == 0 and src == "upstream", f"setup failed: {rc} {src}"
-        set_mode("delay", "192.0.2.40", 3.0)  # 3s delay > 2s upstream timeout
-        time.sleep(5.5)  # fresh A expires
-        t0 = time.time()
-        rc, ans, src = dns_query()  # upstream times out at 2s; delayed A lands ~1s later
-        check("D1 延迟模式下先按超时处理 -> stale",
-              rc == 0 and src == "cache-stale" and 1.8 <= time.time() - t0 <= 4,
-              f"ans={ans} src={src} 耗时={time.time()-t0:.1f}s")
-        time.sleep(1.5)  # the delayed A has now arrived at a closed socket
-        set_mode("nxdomain")
-        rc, ans, src = dns_query()
-        check("D2 随后确认 NXDOMAIN", rc == 3 and src == "upstream",
-              f"rcode={rc} src={src}")
-        set_mode("timeout")
-        time.sleep(5.5)  # past NXDOMAIN freshness; delayed A long arrived
-        rc, ans, src = dns_query()
-        check("D3 迟到旧 A 未复活任何记录 -> SERVFAIL",
-              rc == 2 and not ans, f"rcode={rc} ans={ans} src={src}")
-        cache = get_cache()
-        check("D4 缓存中仍无 A 记录", cache["a_record"] is None,
-              f"cache={cache}")
-        delayed = [r for r in auth_actions() if r[0] == "delay" and r[1] == "answered"]
-        check("D5 权威端确实发出过延迟应答（被解析器丢弃）", len(delayed) >= 1,
-              f"delay 应答次数={len(delayed)}")
+        # -- 4. NXDOMAIN + stale keep their step numbers ---------------------
+        print("4. NXDOMAIN 与 stale 携带步骤号", flush=True)
+        case_nx = [
+            {"type": "mode", "mode": "a", "ip": "192.0.2.30", "delay_seconds": 3},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.30", "expect_step": 1},
+            {"type": "mode", "mode": "nxdomain", "ip": "192.0.2.30", "delay_seconds": 3},
+            {"type": "wait", "seconds": 6},
+            {"type": "query", "expect_rcode": "NXDOMAIN",
+             "expect_ip": "", "expect_step": 3},
+            {"type": "query", "expect_rcode": "NXDOMAIN",
+             "expect_ip": "", "expect_step": 3},
+        ]
+        res_nx = run("A", case_nx)
+        check("4a NXDOMAIN 步骤全部通过", res_nx.get("ok")
+              and all(s["status"] == "ok" for s in res_nx["reg"]["results"]),
+              str([s["status"] for s in res_nx.get("reg", {}).get("results", [])]))
+        if res_nx.get("ok"):
+            cache = res_nx["state"]["cache"]
+            check("4b 缓存保存 NXDOMAIN 与步骤号",
+                  cache["rcode"] == "NXDOMAIN" and cache["a_record"] is None
+                  and cache["auth_step"] == "3", str(cache))
 
-        # -- E. restart does not extend validity -----------------------------
-        print("E. 重启不延长旧 A 有效期", flush=True)
-        set_mode("a", "192.0.2.50")
-        rc, ans, src = dns_query()
-        assert rc == 0 and src == "upstream", f"setup failed: {rc} {src}"
-        stale_until = get_cache()["stale_until"]
-        time.sleep(4)
-        stop("resolver")
-        time.sleep(1)
-        start("resolver", "app.resolver")  # restart with the same DB
-        set_mode("timeout")
-        assert wait_resolver_ready(), "resolver did not come back"
-        sleep_until(stale_until - 4)
-        rc, ans, src = dns_query()
-        check("E1 重启后窗口内仍可用旧 A(绝对期限未变)",
-              rc == 0 and src == "cache-stale" and ans
-              and ans[0][1] == "192.0.2.50", f"ans={ans} src={src}")
-        sleep_until(stale_until + 2)
-        rc, ans, src = dns_query()
-        check("E2 到达原绝对期限即 SERVFAIL（未被重启延长）",
-              rc == 2 and not ans, f"rcode={rc} ans={ans} src={src}")
+        case_stale = [
+            {"type": "mode", "mode": "a", "ip": "192.0.2.40", "delay_seconds": 3},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.40", "expect_step": 1},
+            {"type": "mode", "mode": "timeout", "ip": "192.0.2.40", "delay_seconds": 3},
+            {"type": "wait", "seconds": 6},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.40", "expect_step": 1},
+        ]
+        res_stale = run("A", case_stale)
+        check("4c stale 沿用旧 A 的步骤号", res_stale.get("ok")
+              and res_stale["reg"]["results"][4]["actual"]["source"] == "cache-stale"
+              and res_stale["reg"]["results"][4]["actual"]["auth_step"] == "1",
+              str(res_stale.get("reg", {}).get("results", [{}])[4] if res_stale.get("ok") else res_stale.get("error")))
 
-        # -- F. web console smoke test ---------------------------------------
-        print("F. 网页控制台冒烟", flush=True)
-        with urllib.request.urlopen(f"http://127.0.0.1:{WEB_PORT}/", timeout=5) as r:
-            body = r.read().decode()
-        check("F1 主页可访问", r.status == 200 and "DNS" in body)
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{WEB_PORT}/api/mode",
-            data=json.dumps({"mode": "a", "ip": "192.0.2.60"}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=5) as r:
-            ok = json.load(r)["ok"]
-        check("F2 网页切换模式生效", ok and get_control_mode() == "a")
-        req = urllib.request.Request(f"http://127.0.0.1:{WEB_PORT}/api/query",
-                                     method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            res = json.load(r)
-        check("F3 网页发起查询并显示来源",
-              res["ok"] and res["rcode"] == "NOERROR"
-              and res["source"] in ("upstream", "cache-fresh")
-              and res["answers"] and res["answers"][0]["data"] == "192.0.2.60",
-              f"res={res.get('rcode')} src={res.get('source')}")
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{WEB_PORT}/api/state", timeout=5) as r:
-            st = json.load(r)
-        check("F4 状态接口含控制/缓存/日志",
-              st["control"]["mode"] == "a" and st["cache"]
-              and len(st["resolver_log"]) > 0 and len(st["auth_log"]) > 0)
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{WEB_PORT}/api/mode",
-            data=json.dumps({"mode": "bogus"}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+        # -- 3. rounds A and B in parallel, isolated -------------------------
+        print("3. 两轮并行、各自权威/缓存/日志", flush=True)
+        case_b = [
+            {"type": "mode", "mode": "a", "ip": "198.51.100.77", "delay_seconds": 2},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "198.51.100.77", "expect_step": 1},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "198.51.100.77", "expect_step": 1},
+        ]
+        par_a = [
+            {"type": "mode", "mode": "a", "ip": "203.0.113.9", "delay_seconds": 2},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "203.0.113.9", "expect_step": 1},
+            {"type": "wait", "seconds": 2},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "203.0.113.9", "expect_step": 1},
+        ]
+        out: dict[str, dict] = {}
+        threads = [threading.Thread(target=lambda rid=rid, case=case:
+                                    out.__setitem__(rid, run(rid, case)))
+                   for rid, case in (("A", par_a), ("B", case_b))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("3a 两轮并行均完成", out["A"].get("ok") and out["B"].get("ok"),
+              f"A={out['A'].get('error')} B={out['B'].get('error')}")
+        if out["A"].get("ok") and out["B"].get("ok"):
+            ra, rb = out["A"]["state"], out["B"]["state"]
+            ips_a = [s["actual"]["a_records"] for s in out["A"]["reg"]["results"] if s["actual"]]
+            ips_b = [s["actual"]["a_records"] for s in out["B"]["reg"]["results"] if s["actual"]]
+            check("3b 各自使用自己的权威地址",
+                  ips_a == [["203.0.113.9"]] * 2 and ips_b == [["198.51.100.77"]] * 2,
+                  f"A={ips_a} B={ips_b}")
+            check("3c 缓存互不干扰",
+                  ra["cache"]["a_record"] == "203.0.113.9"
+                  and rb["cache"]["a_record"] == "198.51.100.77",
+                  f"A={ra['cache']['a_record']} B={rb['cache']['a_record']}")
+            check("3d 端口与数据库相互独立",
+                  ra["auth_port"] != rb["auth_port"]
+                  and ra["resolver_port"] != rb["resolver_port"]
+                  and ra["db_path"] != rb["db_path"])
+            check("3e 日志各自独立",
+                  {r["qname"] for r in ra["auth_log"]}
+                  == {r["qname"] for r in rb["auth_log"]}
+                  and len(ra["auth_log"]) > 0)
+
+        # -- 5. no DNS reply interrupts, results kept, resources recycled ------
+        print("5. 未收到 DNS 报文时中断并保留结果", flush=True)
+        # Start a case whose first steps pass, then freeze the round's resolver
+        # (SIGSTOP keeps the process but stops it answering).  The next query
+        # receives no reply at all, so the round is interrupted at that step;
+        # earlier results are still reported and resources are recycled.
+        http("POST", "/api/rounds/A/run", {"steps": [
+            {"type": "mode", "mode": "a", "ip": "192.0.2.50", "delay_seconds": 1},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.50", "expect_step": 1},
+            {"type": "wait", "seconds": 3},
+            {"type": "query", "expect_rcode": "NOERROR",
+             "expect_ip": "192.0.2.50", "expect_step": 1},
+        ]})
+        # Wait until the first query step has actually been measured, then
+        # freeze the resolver during the wait step.
+        deadline = time.time() + 20
+        running = {}
+        while time.time() < deadline:
+            _, running = http("GET", "/api/rounds/A")
+            reg = running.get("regression") or {}
+            done = [r for r in reg.get("results", []) if r["step_no"] is not None]
+            if any(r["step_no"] == 2 and r["status"] == "ok" for r in done):
+                break
+            time.sleep(0.2)
+        pids = running.get("pids") or {}
+        resolver_pid = pids.get("resolver")
+        check("5a 用例运行中且可见子进程", bool(resolver_pid),
+              f"pids={pids} reg={running.get('regression', {}).get('status')}")
+        if resolver_pid:
+            os.kill(resolver_pid, 19)  # SIGSTOP: alive but no replies
+        deadline = time.time() + 45
+        reg = None
+        while time.time() < deadline:
+            _, st = http("GET", "/api/rounds/A")
+            reg = st.get("regression")
+            if reg and reg.get("status") != "running":
+                break
+            time.sleep(0.4)
+        if resolver_pid:
+            try:
+                os.kill(resolver_pid, 9)  # release the frozen child for cleanup
+            except ProcessLookupError:
+                pass
+        check("5b 轮次被中断", reg is not None and reg.get("status") == "interrupted",
+              str(reg and reg.get("status")))
+        if reg:
+            statuses = [s["status"] for s in reg["results"]]
+            kept = statuses.count("ok")
+            last = reg["results"][-1]
+            check("5c 中断前结果保留、中断处被标出",
+                  kept >= 2 and "fail" not in statuses
+                  and last["status"] == "interrupted" and last["step_no"] == 4,
+                  f"statuses={statuses} last={last['detail']}")
+            check("5d 原因写明未收到 DNS 报文",
+                  "未收到 DNS 报文" in (last["detail"] or ""),
+                  str(last["detail"]))
+        check("5e 中断后资源已回收", st_after_active("A") is False,
+              str(http("GET", "/api/rounds/A")[1].get("pids")))
+
+        # live operation without a case: start the round, query, then recycle
+        st, started = http("POST", "/api/rounds/A/start", {})
+        check("5f 可单独启动轮次供现场操作", st == 200 and started.get("ok"),
+              str(started.get("error")))
+        st, started_again = http("POST", "/api/rounds/A/start", {})
+        check("5g 重复启动返回同一轮次", started_again.get("already") is True)
+        st, empty = http("POST", "/api/rounds/A/mode",
+                         {"mode": "a", "ip": "192.0.2.71", "delay_seconds": 1})
+        st, live = http("POST", "/api/rounds/A/query", {})
+        check("5h 空缓存现场查询回源且步骤号为空",
+              live.get("ok") and live.get("source") == "upstream"
+              and live.get("a_records") == ["192.0.2.71"]
+              and live.get("auth_step") is None, str(live))
+        http("POST", "/api/rounds/A/stop", {})
+
+        # -- 6. endpoint start failure is reported at the interruption point --
+        print("6. 端点启动失败：标注中断处与原因", flush=True)
+        # Occupy the UDP ports the console would hand to round B, so its
+        # authoritative endpoint cannot bind and startup fails.
+        blockers = []
         try:
-            urllib.request.urlopen(req, timeout=5)
-            check("F5 非法模式被拒绝", False)
-        except urllib.error.HTTPError as e:
-            check("F5 非法模式被拒绝", e.code == 400)
+            # Block round B's whole probe window (base + 200), so port
+            # allocation itself fails and neither endpoint can start.
+            for port in range(26353, 26353 + 200):
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.bind(("127.0.0.1", port))
+                    blockers.append(s)
+                except OSError:
+                    s.close()
+            st, r = http("POST", "/api/rounds/B/run", {"steps": [
+                {"type": "mode", "mode": "a", "ip": "192.0.2.60"},
+                {"type": "query", "expect_rcode": "NOERROR", "expect_ip": "192.0.2.60"},
+            ]})
+            _, st_b = http("GET", "/api/rounds/B")
+            reg = st_b.get("regression")
+            check("6a 启动失败标记为中断", reg is not None
+                  and reg.get("status") == "interrupted",
+                  str(reg and reg.get("status")))
+            if reg:
+                check("6b 原因写明端点启动失败",
+                      "启动" in reg["results"][0]["detail"]
+                      or "失败" in reg["results"][0]["detail"],
+                      reg["results"][0]["detail"])
+                check("6c 未执行步骤标记为 skipped",
+                      all(s["status"] in ("interrupted", "skipped")
+                          for s in reg["results"]),
+                      str([s["status"] for s in reg["results"]]))
+            check("6d 启动失败后未残留进程", not st_b.get("active"),
+                  str(st_b.get("pids")))
+        finally:
+            for s in blockers:
+                s.close()
+
+        # -- 7. page and API -------------------------------------------------
+        print("7. 页面与接口", flush=True)
+        with urllib.request.urlopen(BASE + "/", timeout=5) as r:
+            body = r.read().decode()
+        check("7a 页面包含用例编排与两轮",
+              r.status == 200 and "回归" in body
+              and "ROUND_IDS = [\'A\', \'B\']" in body
+              and "const MAX_STEPS = 12, MAX_WAIT = 30" in body)
+        check("7b 参数接口", p["domain"] == "service.example")
     finally:
-        for name in list(procs):
-            stop(name)
-        print(f"[selftest] logs in {TMP}", flush=True)
+        http("POST", "/api/rounds/A/stop", {}) if proc.poll() is None else None
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        print(f"[regtest] logs in {TMP}", flush=True)
 
-    print(f"\n{'=' * 60}\n结果: {len(FAILS)} 项失败" if FAILS
-          else f"\n{'=' * 60}\n结果: 全部通过", flush=True)
-    return 1 if FAILS else 0
-
-
-def get_control_mode() -> str:
-    conn = sqlite3.connect(DB, timeout=15)
-    mode = conn.execute("SELECT mode FROM control WHERE id = 1").fetchone()[0]
-    conn.close()
-    return mode
+    print(f"\n{'=' * 60}")
+    if FAILS:
+        print(f"结果: {len(FAILS)} 项失败")
+        for name in FAILS:
+            print("  -", name)
+        return 1
+    print("结果: 全部通过")
+    return 0
 
 
 if __name__ == "__main__":
